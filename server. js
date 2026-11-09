@@ -1,0 +1,210 @@
+// Yard Shot match server: rooms of up to 4 players, 2 teams, bot fillers (run by the host's browser, judged here),
+// server-side damage, fire-rate and range checks, and the Neo-Tokyo train clock.
+// Run: npm install && npm start   (PORT env var is honoured; put it behind https/wss in production)
+const http = require('http');
+const { WebSocketServer } = require('ws');
+
+const PORT = process.env.PORT || 8080;
+const ORIGIN = process.env.ALLOWED_ORIGIN || '';            // e.g. https://yourgame.netlify.app  (empty = allow all)
+const MAX = 4, HEAD = 2, RESPAWN_MS = 2500, TICK_MS = 50, READY_TIMEOUT = 20000, MAPS = 4;
+// Same order as WEAPONS in game.js: SMG, AR, Sniper, Shotgun, DMR, LMG
+const WEAPONS = [{ dmg: 12, delay: 0.06, pellets: 1 }, { dmg: 20, delay: 0.1, pellets: 1 }, { dmg: 90, delay: 1.3, pellets: 1 },
+                 { dmg: 14, delay: 0.7, pellets: 8 }, { dmg: 50, delay: 0.4, pellets: 1 }, { dmg: 15, delay: 0.085, pellets: 1 }];
+const DIFF_DMG = [0.75, 1, 1.4];                             // bot damage multiplier: easy / normal / hard
+const BOT_NAMES = ['Sora', 'Kenji', 'Mika', 'Ryu'];
+const BOT_SKINS = [0x4a7a3a, 0x2f6fd6, 0x8a3fd6, 0xe0a000, 0x2a2d2f, 0xd4a017, 0xb04cff];
+// Neo-Tokyo train schedule: MUST match buildNeo() in maps.js.
+const NEO = { ox: 1800, LEN: 26.3, CYC: 26, WARN: 4, RUN: 4.5, START: 9, lanes: [{ x: -2.3, dir: 1, off: 0 }, { x: 2.3, dir: -1, off: 13 }] };
+
+const server = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('Yard Shot server OK\n'); });
+const wss = new WebSocketServer({ server, maxPayload: 8192, verifyClient: info => !ORIGIN || info.origin === ORIGIN });
+const rooms = new Map();
+let nextId = 1;
+
+const num = (v, d = 0) => (typeof v === 'number' && isFinite(v) ? v : d);
+const clean = s => String(s || 'Player').replace(/[^\w \-]/g, '').trim().slice(0, 14) || 'Player';
+const send = (p, m) => { if (p.ws && p.ws.readyState === 1) p.ws.send(JSON.stringify(m)); };
+const all = (r, m) => r.players.forEach(p => send(p, m));
+const members = r => r.players.concat(r.bots);
+const info = p => ({ id: p.id, name: p.name, team: p.team, slot: p.slot, bot: !!p.bot, w: p.w, skin: p.skin });
+function code() {
+  const L = 'ABCDEFGHJKMNPQRSTUVWXYZ';
+  let c;
+  do { c = Array.from({ length: 4 }, () => L[Math.floor(Math.random() * L.length)]).join(''); } while (rooms.has(c));
+  return c;
+}
+const roomMsg = r => ({ t: 'room', code: r.code, host: r.host, map: r.map, len: r.len, fill: r.fill, diff: r.diff, started: r.started, players: r.players.map(info) });
+const pushRoom = r => all(r, roomMsg(r));
+const teamCount = (r, t) => members(r).filter(x => x.team === t).length;
+const freeSlot = r => [0, 1, 2, 3].find(s => !members(r).some(x => x.slot === s));
+
+function addPlayer(r, p) {
+  p.team = teamCount(r, 'A') <= teamCount(r, 'B') ? 'A' : 'B';
+  p.slot = freeSlot(r);
+  p.room = r; r.players.push(p);
+  if (!r.host) r.host = p.id;
+}
+function leave(p) {
+  const r = p.room;
+  if (!r) return;
+  r.players = r.players.filter(x => x !== p);
+  p.room = null;
+  if (!r.players.length) { stop(r); rooms.delete(r.code); return; }
+  if (r.host === p.id) {
+    r.host = r.players[0].id;
+    if (r.bots.length) { r.bots = []; all(r, { t: 'nobots' }); }          // the new host's browser has no bot AI running yet
+  }
+  if (r.started && !(members(r).some(x => x.team === 'A') && members(r).some(x => x.team === 'B'))) finish(r);
+  pushRoom(r);
+}
+function start(r) {
+  if (r.started) return;
+  const A = r.players.some(p => p.team === 'A'), B = r.players.some(p => p.team === 'B');
+  if (!r.fill && !(A && B)) return all(r, { t: 'err', m: 'Need at least one player on each team (or turn on bot fill).' });
+  r.bots = [];
+  if (r.fill) {                                                              // top the room up to 4 with bots, keeping teams even
+    for (let i = 0; members(r).length < MAX; i++) {
+      const b = { id: 'b' + (i + 1), bot: true, name: BOT_NAMES[i % 4], team: teamCount(r, 'A') <= teamCount(r, 'B') ? 'A' : 'B', slot: freeSlot(r),
+                  w: Math.floor(Math.random() * WEAPONS.length), skin: BOT_SKINS[Math.floor(Math.random() * BOT_SKINS.length)] };
+      r.bots.push(b);
+    }
+  }
+  r.started = true; r.go = false;
+  members(r).forEach(p => Object.assign(p, { hp: 100, alive: true, kills: 0, deaths: 0, ready: !!p.bot, respawnAt: 0, lastShot: {}, x: 0, y: 0, z: 0, yaw: 0, lastSt: Date.now() }));
+  all(r, { t: 'start', map: r.map, len: r.len, diff: r.diff, players: members(r).map(info) });
+  r.readyTimer = setTimeout(() => go(r), READY_TIMEOUT);
+}
+function go(r) {
+  if (!r.started || r.go) return;
+  clearTimeout(r.readyTimer);
+  r.go = true; r.goAt = Date.now();
+  all(r, { t: 'go' });
+  r.tick = setInterval(() => {
+    const q = members(r).map(p => [p.id, +p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2), +p.yaw.toFixed(2), Math.round(p.hp), p.alive ? 1 : 0, p.kills, p.deaths]);
+    trains(r);
+    all(r, { t: 'snap', p: q, tm: +((Date.now() - r.goAt) / 1000).toFixed(2) });
+  }, TICK_MS);
+  r.endTimer = setTimeout(() => finish(r), (r.len + 3.5) * 1000);
+}
+function trains(r) {
+  if (r.map !== 3) return;
+  const tN = NEO.START + (Date.now() - r.goAt) / 1000;
+  NEO.lanes.forEach(L => {
+    const ph = (tN + L.off) % NEO.CYC;
+    if (ph < NEO.WARN || ph >= NEO.WARN + NEO.RUN) return;
+    const p = (ph - NEO.WARN) / NEO.RUN, head = L.dir > 0 ? -50 + p * (100 + NEO.LEN) : 50 - p * (100 + NEO.LEN), tail = head - L.dir * NEO.LEN;
+    const z0 = Math.min(head, tail) - 0.3, z1 = Math.max(head, tail) + 0.3, lx = NEO.ox + L.x;
+    members(r).forEach(t => {
+      if (!t.alive || t.y >= -1.2 || Math.abs(t.x - lx) >= 1.7 || t.z <= z0 || t.z >= z1) return;
+      t.hp = 0; t.alive = false; t.deaths++; t.respawnAt = Date.now() + RESPAWN_MS;
+      all(r, { t: 'dmg', to: t.id, by: 'train', hp: 0, head: false });
+    });
+  });
+}
+function stop(r) { clearTimeout(r.readyTimer); clearTimeout(r.endTimer); clearInterval(r.tick); }
+function finish(r) {
+  if (!r.started) return;
+  stop(r);
+  const score = { A: 0, B: 0 };
+  members(r).forEach(p => { score[p.team] += p.kills; });
+  r.started = false; r.go = false; r.bots = [];
+  all(r, { t: 'end', score });
+  pushRoom(r);
+}
+function damage(r, att, t, dmg, head) {
+  t.hp -= dmg;
+  if (t.hp <= 0) { t.hp = 0; t.alive = false; t.deaths++; att.kills++; t.respawnAt = Date.now() + RESPAWN_MS; }
+  all(r, { t: 'dmg', to: t.id, by: att.id, hp: Math.round(t.hp), head: !!head });
+}
+function hit(p, m) {                                                         // a human shot someone (human or bot)
+  const r = p.room;
+  if (!r || !r.go || !p.alive) return;
+  const w = WEAPONS[m.w | 0], t = members(r).find(x => String(x.id) === String(m.to));
+  if (!w || !t || !t.alive || t.team === p.team) return;
+  const now = Date.now();
+  if (now - (p.lastShot[m.w] || 0) < w.delay * 600) return;                 // fire-rate check (40% lag tolerance)
+  p.lastShot[m.w] = now;
+  if (Math.hypot(t.x - p.x, t.z - p.z) > 140) return;                        // range check
+  const n = Math.max(1, Math.min(w.pellets, m.n | 0));
+  damage(r, p, t, w.dmg * n * (m.head ? HEAD : 1), m.head);
+}
+function botHit(p, m) {                                                      // the host's browser says one of its bots shot someone
+  const r = p.room;
+  if (!r || !r.go || r.host !== p.id) return;
+  const b = r.bots.find(x => x.id === m.by), t = members(r).find(x => String(x.id) === String(m.to));
+  if (!b || !b.alive || !t || !t.alive || t.team === b.team) return;
+  const now = Date.now();
+  if (now - (b.lastShot.b || 0) < 110) return;                               // bots can't out-fire a human
+  b.lastShot.b = now;
+  if (Math.hypot(t.x - b.x, t.z - b.z) > 60) return;
+  const d = Math.min(14, Math.max(4, WEAPONS[b.w].dmg * 0.35)) * DIFF_DMG[r.diff] ;
+  damage(r, b, t, d, false);
+}
+
+wss.on('connection', ws => {
+  const p = { id: String(nextId++), ws, name: 'Player', room: null, team: 'A', slot: 0, hp: 100, alive: true, kills: 0, deaths: 0, x: 0, y: 0, z: 0, yaw: 0, lastShot: {}, lastSt: 0, respawnAt: 0 };
+  send(p, { t: 'hello', id: p.id });
+  ws.on('message', raw => {
+    let m;
+    try { m = JSON.parse(raw); } catch (e) { return; }
+    const r = p.room;
+    switch (m.t) {
+      case 'join': {
+        if (p.room) leave(p);
+        p.name = clean(m.name);
+        let room = null;
+        if (m.quick) room = [...rooms.values()].find(x => x.pub && !x.started && x.players.length < MAX);
+        else if (m.room) room = rooms.get(String(m.room).toUpperCase().trim());
+        if (!room && !m.quick && m.room) return send(p, { t: 'err', m: 'Room not found.' });
+        if (!room) { room = { code: code(), host: null, players: [], bots: [], map: 0, len: 180, fill: true, diff: 1, started: false, go: false, pub: !!m.quick }; rooms.set(room.code, room); }
+        if (room.started) return send(p, { t: 'err', m: 'That match already started.' });
+        if (room.players.length >= MAX) return send(p, { t: 'err', m: 'Room is full.' });
+        addPlayer(room, p);
+        pushRoom(room);
+        if (room.pub && room.players.length === MAX) start(room);
+        break;
+      }
+      case 'leave': leave(p); send(p, { t: 'room', code: null, players: [] }); break;
+      case 'cfg':
+        if (r && !r.started && r.host === p.id) {
+          r.map = Math.min(MAPS - 1, Math.max(0, m.map | 0));
+          r.len = [120, 180, 300].includes(m.len | 0) ? m.len | 0 : 180;
+          r.fill = m.fill !== false; r.diff = Math.min(2, Math.max(0, m.diff | 0));
+          pushRoom(r);
+        }
+        break;
+      case 'team': if (r && !r.started && ['A', 'B'].includes(m.team) && teamCount(r, m.team) < 2) { p.team = m.team; pushRoom(r); } break;
+      case 'start': if (r && r.host === p.id) start(r); break;
+      case 'ready': if (r && r.started && !r.go) { p.ready = true; if (r.players.every(x => x.ready)) go(r); } break;
+      case 'st': {
+        if (!r || !r.go || !p.alive) break;
+        const now = Date.now(), dt = Math.max(0.05, (now - p.lastSt) / 1000), x = num(m.x), z = num(m.z);
+        p.lastSt = now;
+        if (p.x === 0 && p.z === 0 || Math.hypot(x - p.x, z - p.z) <= 12 * dt + 3) { p.x = x; p.z = z; p.y = num(m.y); }   // ignore teleports
+        p.yaw = num(m.yaw);
+        break;
+      }
+      case 'bst':                                                            // host uploads where its bots are
+        if (r && r.go && r.host === p.id && Array.isArray(m.b)) m.b.slice(0, 4).forEach(a => {
+          const b = r.bots.find(x => x.id === a[0]);
+          if (b && b.alive) { b.x = num(a[1]); b.y = num(a[2]); b.z = num(a[3]); b.yaw = num(a[4]); }
+        });
+        break;
+      case 'bhit': botHit(p, m); break;
+      case 'bresp': {
+        const b = r && r.go && r.host === p.id && r.bots.find(x => x.id === m.id), now = Date.now();
+        if (b && !b.alive && now >= b.respawnAt - 400) { b.alive = true; b.hp = 100; b.x = num(m.x); b.y = num(m.y); b.z = num(m.z); all(r, { t: 'resp', id: b.id }); }
+        break;
+      }
+      case 'hit': hit(p, m); break;
+      case 'resp': {
+        const now = Date.now();
+        if (r && r.go && !p.alive && now >= p.respawnAt - 400) { p.alive = true; p.hp = 100; p.x = num(m.x); p.y = num(m.y); p.z = num(m.z); p.lastSt = now; all(r, { t: 'resp', id: p.id }); }
+        break;
+      }
+    }
+  });
+  ws.on('close', () => leave(p));
+  ws.on('error', () => {});
+});
+server.listen(PORT, () => console.log('Yard Shot server listening on ' + PORT));
